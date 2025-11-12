@@ -1,124 +1,254 @@
+# ==========================================================
+# DLCV HW3 P2 — Final Inference Script (for hw3_2.sh)
+# ----------------------------------------------------------
+# ✔ interface: python3 inference.py $1 $2 $3
+#    $1 = folder containing test images (e.g. images/val/)
+#    $2 = output json path
+#    $3 = baseline decoder_model.bin
+#
+# ✔ projector + LoRA are loaded from repo relative path:
+#       output_p2/projector_final.pth
+#       output_p2/decoder_lora_final.pth
+#
+# ✔ full float32 pipeline (no bf16), avoid dtype mismatch
+# ✔ prompt: "Describe the image: "
+# ✔ decoding: temperature=0.7, top_p=0.95, repetition_penalty=1.1
+# ✔ output json: { "xxxxxx.jpg": "caption", ... }
+# ==========================================================
+
 import os
+import sys
 import json
-import torch
-import argparse
+from typing import Dict
+
 from tqdm import tqdm
 from PIL import Image
 
-from llava.model.builder import load_pretrained_model
-from vcd_utils.vcd_sample import evolve_vcd_sampling
-from vcd_utils.vcd_add_noise import add_diffusion_noise
+import torch
+import torch.nn.functional as F
 
-# ===============================================================
-# ✅ VCD Inference Script for DLCV HW3 (Problem 1-2)
-# ===============================================================
+from decoder import Decoder, Config
+from tokenization_qwen3 import Qwen3Tokenizer
+import importlib.util
 
-@torch.inference_mode()
+
+# ------------------------- 動態載入 llava 子模組 -------------------------
+def _load_submodule(mod_name: str, file_path: str, package: str):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = package
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_vision_and_projector(repo_root: str):
+    """固定使用訓練時的視覺設定：Vit-B/16 layer -2 + mlp2x_gelu projector"""
+    mm_vision_tower = "openai/clip-vit-base-patch16"
+    mm_vision_select_layer = -2
+    mm_projector_type = "mlp2x_gelu"
+    mm_hidden_size = 768
+    hidden_size = 1024
+
+    enc_dir = os.path.join(repo_root, "llava", "model", "multimodal_encoder")
+    proj_dir = os.path.join(repo_root, "llava", "model", "multimodal_projector")
+
+    _load_submodule(
+        "llava.model.multimodal_encoder.clip_encoder",
+        os.path.join(enc_dir, "clip_encoder.py"),
+        "llava.model.multimodal_encoder"
+    )
+    enc_builder = _load_submodule(
+        "llava.model.multimodal_encoder.builder",
+        os.path.join(enc_dir, "builder.py"),
+        "llava.model.multimodal_encoder"
+    )
+    proj_builder = _load_submodule(
+        "llava.model.multimodal_projector.builder",
+        os.path.join(proj_dir, "builder.py"),
+        "llava.model.multimodal_projector"
+    )
+
+    cfg = type("Cfg", (), {
+        "mm_vision_tower": mm_vision_tower,
+        "mm_vision_select_layer": mm_vision_select_layer,
+        "mm_projector_type": mm_projector_type,
+        "mm_hidden_size": mm_hidden_size,
+        "hidden_size": hidden_size
+    })()
+
+    vision_tower = enc_builder.build_vision_tower(cfg, delay_load=False).eval()
+    projector = proj_builder.build_vision_projector(cfg).eval()
+    image_processor = vision_tower.image_processor
+    return vision_tower, projector, image_processor
+
+
+# ------------------------- clean caption -------------------------
+def clean_caption(text: str) -> str:
+    out = []
+    for ch in text:
+        if 32 <= ord(ch) <= 126:
+            out.append(ch)
+        else:
+            out.append(" ")
+    s = " ".join("".join(out).split())
+    return s.strip()
+
+
+# ------------------------- repetition penalty -------------------------
+def apply_repetition_penalty(logits, generated_ids, penalty):
+    if not generated_ids or penalty == 1.0:
+        return logits
+    logits_view = logits[0]
+    for tid in set(generated_ids):
+        logits_view[tid] /= penalty
+    return logits
+
+
+# ------------------------- nucleus sampling -------------------------
+def sample_top_p(probs, top_p):
+    probs = probs.clone()
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    total = probs.sum()
+    if total <= 0:
+        return int(torch.argmax(probs).item())
+    probs = probs / total
+
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    cumulative = torch.cumsum(sorted_probs, dim=-1)
+
+    mask = cumulative > top_p
+    mask[1:] = mask[:-1].clone()
+    mask[0] = False
+    sorted_probs[mask] = 0.0
+
+    new_total = sorted_probs.sum()
+    if new_total > 0:
+        sorted_probs /= new_total
+    else:
+        return int(torch.argmax(probs).item())
+
+    next_local = torch.multinomial(sorted_probs, 1)
+    next_token = sorted_idx[next_local]
+    return int(next_token.item())
+
+
+# ==========================================================
+# Main (符合 hw3_2.sh)
+# ==========================================================
 def main():
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("annotation_file", type=str, help="path to val.json")
-    parser.add_argument("images_root", type=str, help="path to images/val folder")
-    parser.add_argument("llava_weight", type=str, help="path to llava-v1.5-7b checkpoint")
-    parser.add_argument("pred_file", type=str, help="output json path (pred_vcd.json)")
+    parser.add_argument("images_root")     # $1
+    parser.add_argument("output_json")     # $2
+    parser.add_argument("decoder_weight")  # $3 (baseline decoder_model.bin)
     args = parser.parse_args()
 
-    # ---------------------------------------------------------------
-    # 1️⃣ Load pretrained model (LLaVA-v1.5-7b)
-    # ---------------------------------------------------------------
-# ---------------------------------------------------------------
-# 1️⃣ Load pretrained model (LLaVA-v1.5-7b)
-# ---------------------------------------------------------------
-    print("🧠 Loading pretrained LLaVA model ...")
-    llava_weight = args.llava_weight  # 保持名稱一致
-    tokenizer, model, image_processor, _ = load_pretrained_model(
-        llava_weight,
-        model_base=None,
-        model_name="llava-v1.5-7b",
-        device_map="auto",
-        device="cuda"
+    torch.set_grad_enabled(False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"🖥️ device = {device}")
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    cfg = Config()
+
+    # ------------------ Load Vision Tower + Projector ------------------
+    print("📷 Building vision & projector...")
+    vision_tower, projector, image_processor = build_vision_and_projector(repo_root)
+    vision_tower.to(device).eval()
+    projector.to(device).eval()
+
+    # projector 權重（相對路徑）
+    projector_path = os.path.join(repo_root, "output_p2", "projector_final.pth")
+    projector.load_state_dict(torch.load(projector_path, map_location="cpu"), strict=True)
+
+    # ------------------ Load Decoder + baseline + LoRA ------------------
+    print("📥 Loading decoder baseline...")
+    decoder = Decoder(cfg).to(device)
+    decoder.load_state_dict(torch.load(args.decoder_weight, map_location="cpu"), strict=False)
+
+    lora_path = os.path.join(repo_root, "output_p2", "decoder_lora_final.pth")
+    print("📥 Loading decoder LoRA...")
+    decoder.load_state_dict(torch.load(lora_path, map_location="cpu"), strict=False)
+
+    decoder.eval()
+    dtype = decoder.embed_tokens.weight.dtype
+
+    # ------------------ Tokenizer & Prompt ------------------
+    tok = Qwen3Tokenizer(
+        os.path.join(repo_root, "vocab.json"),
+        os.path.join(repo_root, "merges.txt")
     )
-    model.eval()
-    evolve_vcd_sampling()  # enable Visual Contrastive Decoding
-    print("✅ Model ready for VCD inference")
 
-    # ---------------------------------------------------------------
-    # 2️⃣ Load dataset annotations
-    # ---------------------------------------------------------------
-    with open(args.annotation_file, "r") as f:
-        annotations = json.load(f)
+    PROMPT = "Describe the image: "
+    prompt_ids = torch.tensor([tok.encode(PROMPT)], dtype=torch.long, device=device)
+    prompt_emb = decoder.embed_tokens(prompt_ids).to(dtype)
 
-    results = []
+    EOS_ID = 151645
+    PAD_ID = 151643
 
-    # ---------------------------------------------------------------
-    # 3️⃣ Loop over each image-question pair
-    # ---------------------------------------------------------------
-    for ann in tqdm(annotations, desc="Running VCD inference"):
-        image_name = ann["image_source"] + ".jpg"
-        image_path = os.path.join(args.images_root, image_name)
-        question = ann["question"]
+    # ------------------ List input images ------------------
+    img_files = sorted([f for f in os.listdir(args.images_root) if f.endswith(".jpg")])
 
-        # ---- Load & preprocess image ----
-        image = Image.open(image_path).convert("RGB")
-        image_tensor = image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0].half().cuda()
+    print(f"🪄 Generating captions for {len(img_files)} images...")
+    preds: Dict[str, str] = {}
 
-        # ---- Generate noisy version (v′) ----
-        noise_step = 700  # moderately strong noise
-        image_tensor_cd = add_diffusion_noise(image_tensor, noise_step).half().cuda()
+    # ------------------ Loop over all images ------------------
+    for fname in tqdm(img_files):
+        stem = os.path.splitext(fname)[0]
+        img_path = os.path.join(args.images_root, fname)
+        image = Image.open(img_path).convert("RGB")
 
-        # ---- Prepare text input ----
-        prompt = f"You are a helpful visual assistant. Answer with a single word: Yes or No.\nQuestion: {question}\nAnswer:"
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+        # vision → projector
+        with torch.no_grad():
+            pixel = image_processor(images=[image], return_tensors="pt")["pixel_values"].to(device)
+            feats = vision_tower(pixel)       # (1, T, 768)
+            feats = feats.mean(dim=1)         # (1, 768)
+            vis_emb = projector(feats).unsqueeze(1).to(dtype)  # (1,1,1024)
 
-        # -----------------------------------------------------------
-        # 4️⃣ Run generation with Visual Contrastive Decoding
-        # -----------------------------------------------------------
-        outputs = model.generate(
-            input_ids=input_ids,
-            images=image_tensor.unsqueeze(0),
-            images_cd=image_tensor_cd.unsqueeze(0),
-            cd_alpha=0.4,
-            cd_beta=0.2,
-            do_sample=True,
-            max_new_tokens=3,
-            temperature=1.0,
-            return_dict_in_generate=False,
-            output_scores=False,
-            output_hidden_states=False,
-            output_attentions=False,
-        )
+        # prefix embeddings
+        inputs_embeds = torch.cat([vis_emb, prompt_emb], dim=1)
 
-        # ---- Decode and normalize answer ----
-        ans_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        ans_text = ans_text.strip().split("\n")[-1]
-        if "yes" in ans_text.lower():
-            ans = "Yes"
-        elif "no" in ans_text.lower():
-            ans = "No"
-        else:
-            # fallback rule
-            ans = "Yes" if "y" in ans_text.lower() else "No"
+        generated_ids = []
+        MAX_NEW_TOKENS = 60
+        TEMP = 0.7
+        TOP_P = 0.95
+        REP = 1.1
 
-        results.append({
-            "image_source": ann["image_source"],
-            "question": question,
-            "predict": ans
-        })
+        for _ in range(MAX_NEW_TOKENS):
+            out = decoder(inputs_embeds=inputs_embeds)
+            logits = out[:, -1, :]
 
-        # ---- Free memory between samples ----
-        del outputs, image_tensor, image_tensor_cd, input_ids
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    # ---------------------------------------------------------------
-    # 5️⃣ Write predictions
-    # ---------------------------------------------------------------
-    os.makedirs(os.path.dirname(args.pred_file), exist_ok=True)
-    with open(args.pred_file, "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+            logits = torch.clamp(logits, -50, 50)
+            logits = logits / TEMP
+            logits = apply_repetition_penalty(logits, generated_ids, REP)
+            logits[0, PAD_ID] -= 5
 
-    print(f"🎯 Done! Results saved to {args.pred_file}")
-    print(f"✅ Total samples: {len(results)}")
+            probs = F.softmax(logits, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0, posinf=0, neginf=0)
+
+            next_id = sample_top_p(probs[0], TOP_P)
+
+            if next_id == EOS_ID:
+                break
+
+            generated_ids.append(next_id)
+
+            next_token = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            next_emb = decoder.embed_tokens(next_token).to(dtype)
+            inputs_embeds = torch.cat([inputs_embeds, next_emb], dim=1)
+
+        caption = clean_caption(tok.decode(generated_ids))
+        preds[f"{stem}.jpg"] = caption
+
+    # ------------------ Save output json ------------------
+    os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
+    with open(args.output_json, "w") as f:
+        json.dump(preds, f, ensure_ascii=False, indent=2)
+
+    print(f"✅ Saved predictions to {args.output_json}")
 
 
 if __name__ == "__main__":
     main()
-

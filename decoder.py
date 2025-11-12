@@ -1,26 +1,40 @@
-from typing import Callable, Optional
+# ==========================================================
+# ✅ DLCV HW3 Part 2 — Final Correct Decoder (LoRA version + robust generate)
+# ----------------------------------------------------------
+# ✔ 與 train_decoder.py / inference.py 直接對接
+# ✔ 支援以 inputs_embeds 起步（視覺前綴 + prompt）或 input_ids 起步
+# ✔ LoRA 僅訓練 Q/K/V/O，參數 < 10M（不改動現有結構）
+# ✔ 內建 temperature / top_p / repetition_penalty / eos 停止
+# ==========================================================
+
+from typing import Optional
 import torch
 from torch import nn
+import loralib as lora
 
-
+# ==========================================================
+# 基本設定
+# ==========================================================
 class Config:
-
     def __init__(self):
-        self.vocab_size=151936
-        self.hidden_size=1024
-        self.intermediate_size=3072
-        self.num_hidden_layers=28
-        self.num_attention_heads=16
-        self.num_key_value_heads=8
-        self.head_dim=128
-        self.max_position_embeddings=40960
-        self.rms_norm_eps=1e-6
-        self.rope_theta=1000000
-        self.rope_scaling=None
+        self.vocab_size = 151936
+        self.hidden_size = 1024
+        self.intermediate_size = 3072
+        self.num_hidden_layers = 28
+        self.num_attention_heads = 16
+        self.num_key_value_heads = 8
+        self.head_dim = 128
+        self.max_position_embeddings = 40960
+        self.rms_norm_eps = 1e-6
+        self.rope_theta = 1000000
+        self.rope_scaling = None
 
 
+# ==========================================================
+# RMSNorm
+# ==========================================================
 class Qwen3RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -32,14 +46,13 @@ class Qwen3RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-
+# ==========================================================
+# MLP
+# ==========================================================
 class Qwen3MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -48,272 +61,246 @@ class Qwen3MLP(nn.Module):
         self.act_fn = nn.functional.silu
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ==========================================================
+# Rotary Embedding 工具
+# ==========================================================
 def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+def apply_rotary_pos_emb(q, k, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    return (q * cos + rotate_half(q) * sin), (k * cos + rotate_half(k) * sin)
 
-def compute_default_rope_parameters(
-    config: Optional[Config] = None,
-    device: Optional["torch.device"] = None,
-    seq_len: Optional[int] = None,
-) -> tuple["torch.Tensor", float]:
-   
+
+def compute_default_rope_parameters(config: Optional[Config] = None, device=None):
     base = config.rope_theta
-    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    dim = int(head_dim * partial_rotary_factor)
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim)
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    return inv_freq, 1.0
 
-    attention_factor = 1.0  # Unused in this type of RoPE
 
-    # Compute the inverse frequencies
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
-    return inv_freq, attention_factor
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+# ==========================================================
+# Attention
+# ==========================================================
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
+    b, n_kv, s, d = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(b, n_kv, n_rep, s, d)
+    return hidden_states.reshape(b, n_kv * n_rep, s, d)
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-):
+def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout=0.0):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
     attn_weights = attn_weights.masked_fill(attention_mask, float("-inf"))
-
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
+    attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
     return attn_output, attn_weights
 
 
 class Qwen3Attention(nn.Module):
-
     def __init__(self, config: Config, layer_idx: int):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.is_causal = True
+        self.scaling = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
-        )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  
+        # ✅ LoRA on Q/K/V/O（保留，不改）
+        self.q_proj = lora.Linear(config.hidden_size, config.num_attention_heads * self.head_dim,
+                                  r=16, lora_alpha=32, lora_dropout=0.05, merge_weights=False, bias=False)
+        self.k_proj = lora.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim,
+                                  r=16, lora_alpha=32, lora_dropout=0.05, merge_weights=False, bias=False)
+        self.v_proj = lora.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim,
+                                  r=16, lora_alpha=32, lora_dropout=0.05, merge_weights=False, bias=False)
+        self.o_proj = lora.Linear(config.num_attention_heads * self.head_dim, config.hidden_size,
+                                  r=16, lora_alpha=32, lora_dropout=0.05, merge_weights=False, bias=False)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    def forward(self, hidden_states, position_embeddings, attention_mask):
+        bsz, seq_len, _ = hidden_states.size()
+        shape = (bsz, seq_len, -1, self.head_dim)
+        q = self.q_norm(self.q_proj(hidden_states).view(shape)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(shape)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        attention_interface: Callable = eager_attention_forward
-       
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            scaling=self.scaling,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        
-        
-        return attn_output, attn_weights
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        attn_output, _ = eager_attention_forward(self, q, k, v, attention_mask, scaling=self.scaling)
+        attn_output = attn_output.reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_output), None
 
 
+# ==========================================================
+# Decoder Layer
+# ==========================================================
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Config, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-
+        self.self_attn = Qwen3Attention(config, layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  
-        attention_mask: Optional[torch.Tensor] = None,
-
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, position_embeddings, attention_mask):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            #position_ids=position_ids,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask
-        )
+        hidden_states, _ = self.self_attn(hidden_states, position_embeddings, attention_mask)
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
+        hidden_states = residual + self.mlp(hidden_states)
         return hidden_states
 
 
+# ==========================================================
+# Rotary Embedding
+# ==========================================================
 class Qwen3RotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
     def __init__(self, config: Config, device=None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
         self.config = config
-        self.rope_init_fn = compute_default_rope_parameters
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq, scale = compute_default_rope_parameters(config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self.scale = scale
 
-    @torch.no_grad()
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        inv_freq = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        pos = position_ids[:, None, :].float()
+        freqs = (inv_freq @ pos).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos() * self.scale, emb.sin() * self.scale
 
 
+# ==========================================================
+# Decoder 主體
+# ==========================================================
 class Decoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.padding_idx = 151643
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-
-        self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=151643)
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
 
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-
-    ) -> torch.FloatTensor:
-        
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+    # -------- 主要前向：支援 inputs_embeds 或 input_ids --------
+    def forward(self, input_ids=None, inputs_embeds=None, position_ids=None, attention_mask=None):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds
-        
+        h = inputs_embeds
         if position_ids is None:
-            position_ids = torch.arange(
-                0, hidden_states.size(1), dtype=torch.long, device=hidden_states.device
-            ).unsqueeze(0)
+            position_ids = torch.arange(0, h.size(1), device=h.device).unsqueeze(0)
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        pos_emb = self.rotary_emb(h, position_ids)
 
         if attention_mask is None:
-            batch_size, seq_len = hidden_states.size(0), hidden_states.size(1)
-            causal_mask = torch.triu(
-                torch.ones((seq_len, seq_len), device=hidden_states.device, dtype=torch.bool),
-                diagonal=1
-            )
-            attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+            L = h.size(1)
+            mask = torch.triu(torch.ones(L, L, device=h.device, dtype=torch.bool), diagonal=1)
+            attention_mask = mask.unsqueeze(0).unsqueeze(0)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
+        for layer in self.layers:
+            h = layer(h, pos_emb, attention_mask)
 
-            )
+        h = self.norm(h)
+        return self.lm_head(h)
 
-        hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+    # -------- 取樣工具 --------
+    @staticmethod
+    def _apply_repetition_penalty(logits, generated_ids, penalty: float):
+        if generated_ids is None or penalty == 1.0:
+            return logits
+        # 將已生成過的 token logits 降權（ >1 代表懲罰 ）
+        uniq = generated_ids.unique()
+        logits.index_copy_(dim=-1, index=uniq, source=logits[..., uniq] / penalty)
+        return logits
 
-        return logits    
-         
-    def generate(self, input_ids, max_new_tokens=50, eos_token_id=None):
+    @staticmethod
+    def _top_p_filter(logits, top_p: float):
+        if top_p >= 1.0:
+            return logits
+        probs = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+        cum = torch.cumsum(sorted_probs, dim=-1)
+        mask = cum > top_p
+        # 保留第一個超過 top_p 的位置
+        mask[..., 0] = False
+        sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+        # 轉回 logits（加一個小常數避免 log(0)）
+        new_logits = torch.full_like(logits, float("-inf"))
+        new_logits.scatter_(dim=-1, index=sorted_idx, src=torch.log(sorted_probs + 1e-12))
+        return new_logits
+
+    # -------- 生成：支援從 inputs_embeds 或 input_ids 起步 --------
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 30,
+        eos_token_id: Optional[int] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+    ):
+        device = next(self.parameters()).device
+
+        # 起點：embedding 或 id
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("generate() 需要 input_ids 或 inputs_embeds 其中之一。")
+            input_ids = input_ids.to(device)
+            cur_embeds = self.embed_tokens(input_ids)
+        else:
+            cur_embeds = inputs_embeds.to(device)
+            if input_ids is None:
+                # 若沒有提供對應的 input_ids，建立空的 ids，用於追蹤生成序列
+                input_ids = torch.empty((cur_embeds.size(0), 0), dtype=torch.long, device=device)
+
+        B = cur_embeds.size(0)
+        generated = input_ids  # 追蹤完整 token 序列（只包含文字 token）
+
         for _ in range(max_new_tokens):
-            outputs = self(input_ids=input_ids)
-            next_token = torch.argmax(outputs[:, -1, :], dim=-1, keepdim=True)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            if eos_token_id is not None and next_token.item() == eos_token_id:
-                break
-        return input_ids
+            logits = self(inputs_embeds=cur_embeds)[:, -1, :]  # 只取最後一步
+            # 重複懲罰
+            logits = self._apply_repetition_penalty(logits, generated, repetition_penalty)
+
+            # 溫度/Top-p
+            if temperature != 1.0:
+                logits = logits / max(temperature, 1e-6)
+            logits = self._top_p_filter(logits, top_p)
+
+            # 取樣（或貪婪當作特例）
+            if top_p < 1.0 or temperature != 1.0:
+                probs = torch.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+            else:
+                next_id = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # 續接 ids 與 embeds
+            generated = torch.cat([generated, next_id], dim=1)
+            next_emb = self.embed_tokens(next_id)  # (B,1,H)
+            cur_embeds = torch.cat([cur_embeds, next_emb], dim=1)
+
+            # 早停
+            if eos_token_id is not None:
+                # 若 batch 中所有樣本都生成到 eos，則停止
+                if torch.all(next_id.squeeze(-1) == eos_token_id):
+                    break
+
+        return generated
