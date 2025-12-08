@@ -10,6 +10,7 @@
 #       output_p2/projector_final.pth
 #       output_p2/decoder_lora_final.pth
 #
+# ✔ Uses 'timm' for Vision Encoder (openai/CLIP) to avoid transformers dependency
 # ✔ full float32 pipeline (no bf16), avoid dtype mismatch
 # ✔ prompt: "Describe the image: "
 # ✔ decoding: temperature=0.7, top_p=0.95, repetition_penalty=1.1
@@ -27,6 +28,11 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
+# --- 新增 timm 模組 ---
+import timm
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
+
 from decoder import Decoder, Config
 from tokenization_qwen3 import Qwen3Tokenizer
 import importlib.util
@@ -43,26 +49,35 @@ def _load_submodule(mod_name: str, file_path: str, package: str):
 
 
 def build_vision_and_projector(repo_root: str):
-    """固定使用訓練時的視覺設定：Vit-B/16 layer -2 + mlp2x_gelu projector"""
-    mm_vision_tower = "openai/clip-vit-base-patch16"
-    mm_vision_select_layer = -2
+    """
+    修改版：
+    1. 使用 timm 載入 OpenAI CLIP ViT-Base (vit_base_patch16_clip_224.openai)
+    2. 依然使用本地 builder 載入 Projector
+    """
+    
+    # --- 1. 使用 timm 建立 Vision Tower (OpenAI CLIP) ---
+    print("📷 Building vision tower (timm: vit_base_patch16_clip_224.openai)...")
+    # pretrained=True 會自動下載並載入 openai/CLIP 的權重
+    # num_classes=0 表示移除最後的分類層 (fc layer)，我們只需要特徵
+    vision_tower = timm.create_model(
+        'vit_base_patch16_clip_224.openai', 
+        pretrained=True, 
+        num_classes=0
+    ).eval()
+
+    # 建立對應的圖片預處理 (transforms)
+    config = resolve_data_config({}, model=vision_tower)
+    image_processor = create_transform(**config)
+
+    # --- 2. 載入 Projector (保持原樣，使用本地代碼) ---
     mm_projector_type = "mlp2x_gelu"
-    mm_hidden_size = 768
-    hidden_size = 1024
+    mm_hidden_size = 768   # ViT-Base hidden size
+    hidden_size = 1024     # Decoder hidden size
 
-    enc_dir = os.path.join(repo_root, "llava", "model", "multimodal_encoder")
+    # Projector 的代碼路徑
     proj_dir = os.path.join(repo_root, "llava", "model", "multimodal_projector")
-
-    _load_submodule(
-        "llava.model.multimodal_encoder.clip_encoder",
-        os.path.join(enc_dir, "clip_encoder.py"),
-        "llava.model.multimodal_encoder"
-    )
-    enc_builder = _load_submodule(
-        "llava.model.multimodal_encoder.builder",
-        os.path.join(enc_dir, "builder.py"),
-        "llava.model.multimodal_encoder"
-    )
+    
+    # 只需要載入 Projector 的 builder
     proj_builder = _load_submodule(
         "llava.model.multimodal_projector.builder",
         os.path.join(proj_dir, "builder.py"),
@@ -70,16 +85,13 @@ def build_vision_and_projector(repo_root: str):
     )
 
     cfg = type("Cfg", (), {
-        "mm_vision_tower": mm_vision_tower,
-        "mm_vision_select_layer": mm_vision_select_layer,
         "mm_projector_type": mm_projector_type,
         "mm_hidden_size": mm_hidden_size,
         "hidden_size": hidden_size
     })()
 
-    vision_tower = enc_builder.build_vision_tower(cfg, delay_load=False).eval()
     projector = proj_builder.build_vision_projector(cfg).eval()
-    image_processor = vision_tower.image_processor
+    
     return vision_tower, projector, image_processor
 
 
@@ -154,6 +166,7 @@ def main():
     cfg = Config()
 
     # ------------------ Load Vision Tower + Projector ------------------
+    # Modified: 這裡現在回傳的是 timm model 和 transform
     print("📷 Building vision & projector...")
     vision_tower, projector, image_processor = build_vision_and_projector(repo_root)
     vision_tower.to(device).eval()
@@ -202,9 +215,18 @@ def main():
 
         # vision → projector
         with torch.no_grad():
-            pixel = image_processor(images=[image], return_tensors="pt")["pixel_values"].to(device)
-            feats = vision_tower(pixel)       # (1, T, 768)
-            feats = feats.mean(dim=1)         # (1, 768)
+            # [修改點 1] timm image_processor 回傳的是 Tensor，不是 dict
+            # 並且需要手動增加 batch dimension: (C, H, W) -> (1, C, H, W)
+            pixel = image_processor(image).unsqueeze(0).to(device)
+            
+            # [修改點 2] 使用 forward_features 獲取序列特徵 (B, N, 768)
+            # 補充: timm 的 forward_features 對於 ViT 會回傳包含 patch tokens 的序列
+            feats = vision_tower.forward_features(pixel)  # (1, 197, 768)
+            
+            # [修改點 3] 取平均 (Global Average Pooling) -> (1, 768)
+            feats = feats.mean(dim=1)
+            
+            # 投影 (保持不變)
             vis_emb = projector(feats).unsqueeze(1).to(dtype)  # (1,1,1024)
 
         # prefix embeddings
