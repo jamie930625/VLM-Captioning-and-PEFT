@@ -1,20 +1,20 @@
 # ==========================================================
 # DLCV HW3 P2 — Final Inference Script (for hw3_2.sh)
 # ----------------------------------------------------------
-# ✔ interface: python3 inference.py $1 $2 $3
+# - interface: python3 inference.py $1 $2 $3
 #    $1 = folder containing test images (e.g. images/val/)
 #    $2 = output json path
 #    $3 = baseline decoder_model.bin
 #
-# ✔ projector + LoRA are loaded from repo relative path:
+# - projector + LoRA are loaded from repo relative path:
 #       output_p2/projector_final.pth
 #       output_p2/decoder_lora_final.pth
 #
-# ✔ Uses 'timm' for Vision Encoder (openai/CLIP) to avoid transformers dependency
-# ✔ full float32 pipeline (no bf16), avoid dtype mismatch
-# ✔ prompt: "Describe the image: "
-# ✔ decoding: temperature=0.7, top_p=0.95, repetition_penalty=1.1
-# ✔ output json: { "xxxxxx.jpg": "caption", ... }
+# - Uses 'timm' for Vision Encoder (openai/CLIP) to avoid transformers dependency
+# - full float32 pipeline (no bf16), avoid dtype mismatch
+# - prompt: "Describe the image: "
+# - decoding: temperature=0.7, top_p=0.95, repetition_penalty=1.1
+# - output json: { "xxxxxx.jpg": "caption", ... }
 # ==========================================================
 
 import os
@@ -28,7 +28,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-# --- 新增 timm 模組 ---
+# timm for the vision encoder
 import timm
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
@@ -38,7 +38,7 @@ from tokenization_qwen3 import Qwen3Tokenizer
 import importlib.util
 
 
-# ------------------------- 動態載入 llava 子模組 -------------------------
+# ------------------------- load only the needed llava modules -------------------------
 def _load_submodule(mod_name: str, file_path: str, package: str):
     spec = importlib.util.spec_from_file_location(mod_name, file_path)
     module = importlib.util.module_from_spec(spec)
@@ -50,34 +50,33 @@ def _load_submodule(mod_name: str, file_path: str, package: str):
 
 def build_vision_and_projector(repo_root: str):
     """
-    修改版：
-    1. 使用 timm 載入 OpenAI CLIP ViT-Base (vit_base_patch16_clip_224.openai)
-    2. 依然使用本地 builder 載入 Projector
+    1. Load the OpenAI CLIP ViT-Base vision tower with timm (vit_base_patch16_clip_224.openai).
+    2. Load the projector with the local builder.
     """
     
-    # --- 1. 使用 timm 建立 Vision Tower (OpenAI CLIP) ---
-    print("📷 Building vision tower (timm: vit_base_patch16_clip_224.openai)...")
-    # pretrained=True 會自動下載並載入 openai/CLIP 的權重
-    # num_classes=0 表示移除最後的分類層 (fc layer)，我們只需要特徵
+    # --- 1. vision tower (OpenAI CLIP via timm) ---
+    print("Building vision tower (timm: vit_base_patch16_clip_224.openai)...")
+    # pretrained=True downloads the OpenAI CLIP weights
+    # num_classes=0 removes the classification head; only features are needed
     vision_tower = timm.create_model(
         'vit_base_patch16_clip_224.openai', 
         pretrained=True, 
         num_classes=0
     ).eval()
 
-    # 建立對應的圖片預處理 (transforms)
+    # matching image transforms
     config = resolve_data_config({}, model=vision_tower)
     image_processor = create_transform(**config)
 
-    # --- 2. 載入 Projector (保持原樣，使用本地代碼) ---
+    # --- 2. projector (local code) ---
     mm_projector_type = "mlp2x_gelu"
     mm_hidden_size = 768   # ViT-Base hidden size
     hidden_size = 1024     # Decoder hidden size
 
-    # Projector 的代碼路徑
+    # path to the projector code
     proj_dir = os.path.join(repo_root, "llava", "model", "multimodal_projector")
     
-    # 只需要載入 Projector 的 builder
+    # only the projector builder is needed
     proj_builder = _load_submodule(
         "llava.model.multimodal_projector.builder",
         os.path.join(proj_dir, "builder.py"),
@@ -147,7 +146,7 @@ def sample_top_p(probs, top_p):
 
 
 # ==========================================================
-# Main (符合 hw3_2.sh)
+# Main (called by hw3_2.sh)
 # ==========================================================
 def main():
     import argparse
@@ -160,29 +159,29 @@ def main():
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"🖥️ device = {device}")
+    print(f"device = {device}")
 
     repo_root = os.path.dirname(os.path.abspath(__file__))
     cfg = Config()
 
     # ------------------ Load Vision Tower + Projector ------------------
-    # Modified: 這裡現在回傳的是 timm model 和 transform
-    print("📷 Building vision & projector...")
+    # returns the timm model and its transform
+    print("Building vision & projector...")
     vision_tower, projector, image_processor = build_vision_and_projector(repo_root)
     vision_tower.to(device).eval()
     projector.to(device).eval()
 
-    # projector 權重（相對路徑）
+    # projector weights (relative path)
     projector_path = os.path.join(repo_root, "output_p2", "projector_final.pth")
     projector.load_state_dict(torch.load(projector_path, map_location="cpu"), strict=True)
 
     # ------------------ Load Decoder + baseline + LoRA ------------------
-    print("📥 Loading decoder baseline...")
+    print("Loading decoder baseline...")
     decoder = Decoder(cfg).to(device)
     decoder.load_state_dict(torch.load(args.decoder_weight, map_location="cpu"), strict=False)
 
     lora_path = os.path.join(repo_root, "output_p2", "decoder_lora_final.pth")
-    print("📥 Loading decoder LoRA...")
+    print("Loading decoder LoRA...")
     decoder.load_state_dict(torch.load(lora_path, map_location="cpu"), strict=False)
 
     decoder.eval()
@@ -204,7 +203,7 @@ def main():
     # ------------------ List input images ------------------
     img_files = sorted([f for f in os.listdir(args.images_root) if f.endswith(".jpg")])
 
-    print(f"🪄 Generating captions for {len(img_files)} images...")
+    print(f"Generating captions for {len(img_files)} images...")
     preds: Dict[str, str] = {}
 
     # ------------------ Loop over all images ------------------
@@ -215,18 +214,16 @@ def main():
 
         # vision → projector
         with torch.no_grad():
-            # [修改點 1] timm image_processor 回傳的是 Tensor，不是 dict
-            # 並且需要手動增加 batch dimension: (C, H, W) -> (1, C, H, W)
+            # the timm transform returns a tensor; add the batch dimension (C, H, W) -> (1, C, H, W)
             pixel = image_processor(image).unsqueeze(0).to(device)
             
-            # [修改點 2] 使用 forward_features 獲取序列特徵 (B, N, 768)
-            # 補充: timm 的 forward_features 對於 ViT 會回傳包含 patch tokens 的序列
+            # forward_features returns the token sequence (B, N, 768), including patch tokens
             feats = vision_tower.forward_features(pixel)  # (1, 197, 768)
             
-            # [修改點 3] 取平均 (Global Average Pooling) -> (1, 768)
+            # global average pooling -> (1, 768)
             feats = feats.mean(dim=1)
             
-            # 投影 (保持不變)
+            # projection
             vis_emb = projector(feats).unsqueeze(1).to(dtype)  # (1,1,1024)
 
         # prefix embeddings
@@ -269,7 +266,7 @@ def main():
     with open(args.output_json, "w") as f:
         json.dump(preds, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ Saved predictions to {args.output_json}")
+    print(f"Saved predictions to {args.output_json}")
 
 
 if __name__ == "__main__":

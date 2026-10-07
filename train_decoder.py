@@ -2,17 +2,17 @@
 # ------------------------------------------------------------
 # Train projector (mlp2x_gelu) + Decoder LoRA (Q/K/V/O, r=16)
 # - Vision: CLIP -> select layer (-2) -> mean-pool -> projector -> 1-token prefix
-# - Text: prompt + caption，loss 只計 caption（遮掉 prompt & PAD）
-# - 保存：projector_state_dict.pth + lora_only.pth
-# - 總可訓練參數 < 10M（~5.5M）
+# - Text: prompt + caption; loss on caption tokens only (prompt and PAD masked)
+# - Saves projector_state_dict.pth and lora_only.pth
+# - Total trainable parameters < 10M (about 5.5M)
 # ------------------------------------------------------------
 
 import os
-# 可選加速；若環境沒有也不致命
+# optional speed-up; safe to skip if unavailable
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-# 避免 transformers 在 torch.load 上卡版本警告（你目前 torch=2.9）
+# silence transformers' torch.load version warning
 import transformers
 transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
 transformers.utils.import_utils._torch_load_is_safe = lambda *a, **k: True
@@ -29,16 +29,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.amp import GradScaler, autocast   # ✅ 新版 AMP 介面
+from torch.amp import GradScaler, autocast
 import loralib as lora
 
 from decoder import Decoder, Config
 from tokenization_qwen3 import Qwen3Tokenizer
 
 
-# ------------------------- 動態載入 llava 子模組 -------------------------
+# ------------------------- load only the needed llava modules -------------------------
 def _load_submodule(mod_name: str, file_path: str, package: str):
-    """僅載入需要的 llava 檔案，不觸發 llava/__init__.py。"""
+    """Load only the required llava files without running llava/__init__.py."""
     spec = importlib.util.spec_from_file_location(mod_name, file_path)
     module = importlib.util.module_from_spec(spec)
     module.__package__ = package
@@ -57,7 +57,7 @@ def build_vision_and_projector(repo_root: str,
     enc_dir = os.path.join(repo_root, "llava", "model", "multimodal_encoder")
     proj_dir = os.path.join(repo_root, "llava", "model", "multimodal_projector")
 
-    # 先載 clip_encoder 再載 builder，保持相對匯入順序
+    # load clip_encoder before builder to keep relative imports working
     _load_submodule(
         "llava.model.multimodal_encoder.clip_encoder",
         os.path.join(enc_dir, "clip_encoder.py"),
@@ -74,7 +74,7 @@ def build_vision_and_projector(repo_root: str,
         "llava.model.multimodal_projector"
     )
 
-    # 構建與 TA 介面一致的 cfg
+    # build a config matching the provided interface
     cfg = type("Cfg", (), {
         "mm_vision_tower": mm_vision_tower,
         "mm_vision_select_layer": mm_vision_select_layer,
@@ -84,17 +84,17 @@ def build_vision_and_projector(repo_root: str,
     })()
 
     vision_tower = enc_builder.build_vision_tower(cfg, delay_load=False).eval()
-    projector = proj_builder.build_vision_projector(cfg).train()  # ✅ projector 這次要訓練
+    projector = proj_builder.build_vision_projector(cfg).train()  # the projector is trained
     image_processor = vision_tower.image_processor
     return vision_tower, projector, image_processor
 
 
-# ------------------------- Dataset 與 Collate -------------------------
+# ------------------------- dataset and collate -------------------------
 class CocoCapDataset(Dataset):
     """
-    直接讀圖（images/{split}/xxxx.jpg），不使用預存 .pt。
+    Reads images directly (images/{split}/xxxx.jpg) instead of cached .pt files.
     JSON：{"annotations":[{"image_id": int, "caption": str}, ...]}
-    這版加入固定英文 prompt（避免多語＆統一風格）
+    Adds a fixed English prompt to keep captions in English and in one style.
     """
     def __init__(self, data_root: str, split: str, tokenizer: Qwen3Tokenizer, prompt: str):
         super().__init__()
@@ -111,11 +111,11 @@ class CocoCapDataset(Dataset):
         img_id = int(ann["image_id"])
         img = Image.open(os.path.join(self.img_dir, f"{img_id:012d}.jpg")).convert("RGB")
 
-        # 文字：prompt + caption + EOS
+        # text: prompt + caption + EOS
         caption = ann["caption"].strip()
         full_text = self.prompt + caption + "<|im_end|>"
 
-        # prompt_len（token數）用於遮蔽 loss
+        # prompt length in tokens, used to mask the loss
         prompt_len = len(self.tok.encode(self.prompt))
         ids_full = torch.tensor(self.tok.encode(full_text), dtype=torch.long)
 
@@ -133,16 +133,16 @@ def collate_pad(batch: List[Tuple[Image.Image, torch.Tensor, int, int]],
             pad = torch.full((T - len(ids),), pad_id, dtype=torch.long)
             ids = torch.cat([ids, pad], 0)
 
-        # 右移一格作 teacher forcing：input=[:-1], target=[1:]
-        # 我們先生成 labels（與 ids 等長），稍後在主程式切片
+        # shift by one for teacher forcing: input=[:-1], target=[1:]
+        # labels have the same length as ids and are sliced in the training loop
         lab = ids.clone()
 
-        # 把 prompt 區段的 target 全部遮蔽（loss 不計）
-        # target 是 ids[1:], 所以 prompt 對應 target 位置是 [max(0, p_len-1)] 以前
+        # mask targets in the prompt span (no loss)
+        # targets are ids[1:], so the prompt covers positions before max(0, p_len-1)
         if p_len > 0:
             lab[:p_len] = -100
 
-        # PAD 也遮蔽
+        # mask PAD as well
         lab = torch.where(ids == pad_id, torch.full_like(ids, -100), lab)
 
         padded.append(ids)
@@ -151,26 +151,26 @@ def collate_pad(batch: List[Tuple[Image.Image, torch.Tensor, int, int]],
     return list(images), torch.stack(padded, 0), torch.stack(labels, 0), list(img_ids), list(prompt_lens)
 
 
-# ------------------------- 工具 -------------------------
+# ------------------------- helpers -------------------------
 def count_trainable_params(models: List[nn.Module]) -> int:
     total_trainable = 0
     for m in models:
         total_trainable += sum(p.numel() for p in m.parameters() if p.requires_grad)
-    print(f"🧮 Trainable parameters total: {total_trainable/1e6:.2f}M")
+    print(f"Trainable parameters total: {total_trainable/1e6:.2f}M")
     return total_trainable
 
 
-# ------------------------- 訓練主程式 -------------------------
+# ------------------------- training -------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True,
-                        help="包含 train/val json 與 images/train, images/val 的根目錄")
+                        help="root folder with train/val json files and images/train, images/val")
     parser.add_argument("--baseline_weight", type=str, required=True,
-                        help="TA 提供的 decoder_model.bin")
+                        help="provided decoder_model.bin")
     parser.add_argument("--output_lora", type=str, required=True,
-                        help="輸出 LoRA 權重 .pth（僅 LoRA）")
+                        help="output path for LoRA weights (.pth)")
     parser.add_argument("--output_projector", type=str, required=True,
-                        help="輸出 projector 權重 .pth（state_dict）")
+                        help="output path for projector weights (.pth state_dict)")
 
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -181,20 +181,20 @@ def main():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--seed", type=int, default=1337)
 
-    # 視覺設定（與推論一致）
+    # vision settings (same as inference)
     parser.add_argument("--mm_vision_tower", type=str, default="openai/clip-vit-base-patch16")
     parser.add_argument("--mm_vision_select_layer", type=int, default=-2)
-    parser.add_argument("--mm_projector_type", type=str, default="mlp2x_gelu")  # ✅ 最終設定
+    parser.add_argument("--mm_projector_type", type=str, default="mlp2x_gelu")
     parser.add_argument("--mm_hidden_size", type=int, default=768)
 
-    # 訓練 prompt（固定英文，避免多語）
+    # training prompt (fixed English prompt)
     parser.add_argument("--prompt", type=str, default="Describe the image: ")
 
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🖥️ device = {device}")
+    print(f"device = {device}")
 
     repo_root = os.path.dirname(os.path.abspath(__file__))
     cfg = Config()
@@ -208,18 +208,18 @@ def main():
         mm_hidden_size=args.mm_hidden_size,
         hidden_size=cfg.hidden_size
     )
-    vision_tower.to(device).eval()   # 凍結
-    projector.to(device).train()     # ✅ 這次要訓練
+    vision_tower.to(device).eval()   # frozen
+    projector.to(device).train()     # trained
 
-    # 2) Decoder + baseline + 僅開 LoRA（Q/K/V/O r=16, alpha=32, dropout=0.05 已在 decoder.py 中）
+    # 2) decoder with baseline weights; only LoRA is trainable (Q/K/V/O, r=16, alpha=32, dropout=0.05 in decoder.py)
     dec = Decoder(cfg).to(device)
     dec.load_state_dict(torch.load(args.baseline_weight, map_location="cpu"), strict=False)
-    lora.mark_only_lora_as_trainable(dec, bias="none")  # 只開 LoRA 權重
+    lora.mark_only_lora_as_trainable(dec, bias="none")  # LoRA weights only
 
-    # — 統計總訓練參數（LoRA + projector）
+    # count trainable parameters (LoRA + projector)
     total_trainable = count_trainable_params([dec, projector])
     if total_trainable > 10_000_000:
-        raise SystemExit(f"❌ Trainable parameters exceed 10M ({total_trainable}). 請降低 LoRA rank 或 projector 深度。")
+        raise SystemExit(f"Trainable parameters exceed 10M ({total_trainable}). Reduce the LoRA rank or projector depth.")
 
     # 3) Data / Tokenizer
     tok = Qwen3Tokenizer(os.path.join(repo_root, "vocab.json"),
@@ -236,53 +236,53 @@ def main():
     )
 
     # 4) Optim / AMP / Loss
-    # 只優化 projector + LoRA 參數
+    # optimize projector and LoRA parameters only
     optim = AdamW(
         list(projector.parameters()) + [p for p in dec.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=args.wd
     )
-    scaler = GradScaler(device="cuda", enabled=not args.bf16)  # bf16 不用 scaler
+    scaler = GradScaler(device="cuda", enabled=not args.bf16)  # no scaler with bf16
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     use_bf16 = bool(args.bf16 and torch.cuda.is_available())
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
-    print(f"🧮 compute dtype: {'bf16' if use_bf16 else 'fp32'}")
+    print(f"compute dtype: {'bf16' if use_bf16 else 'fp32'}")
 
     dec.train()
     projector.train()
-    vis_prefix_len = 1  # 使用 mean-pool 後 1 個視覺前綴 token
+    vis_prefix_len = 1  # one visual prefix token after mean pooling
 
     for ep in range(1, args.epochs + 1):
         running = 0.0
         for it, (images, ids_full, labels_full, _, prompt_lens) in enumerate(train_loader, 1):
-            # ------- 圖片 embedding（不需要梯度）-------
+            # ------- image features (no gradient) -------
             with torch.no_grad():
                 pixel = image_processor(images=list(images), return_tensors="pt")["pixel_values"].to(device)
-                feats = vision_tower(pixel)            # (B, T_patch, mm_hidden) 來自指定層
-                feats = feats.mean(dim=1)              # (B, mm_hidden) → mean-pool 成單向量
-            # projector 需訓練 → 開梯度
+                feats = vision_tower(pixel)            # (B, T_patch, mm_hidden) from the selected layer
+                feats = feats.mean(dim=1)              # (B, mm_hidden), mean-pooled to one vector
+            # the projector is trained, so gradients are on
             vis_emb = projector(feats).unsqueeze(1).to(compute_dtype)  # (B,1,H)
 
-            # ------- 文字（teacher forcing, 遮蔽 prompt 區段）-------
+            # ------- text (teacher forcing, prompt span masked) -------
             # ids_full: [prompt + caption + EOS + PAD...]
-            input_ids = ids_full[:, :-1].to(device)    # 模型輸入
-            target_ids = labels_full[:, 1:].to(device) # 模型目標（已在 collate 遮蔽 prompt/PAD）
+            input_ids = ids_full[:, :-1].to(device)    # model input
+            target_ids = labels_full[:, 1:].to(device) # targets (prompt/PAD masked in collate)
 
             with torch.no_grad():
                 txt_emb = dec.embed_tokens(input_ids).to(compute_dtype)  # (B, L-1, H)
 
-            # ------- 視覺前綴 + 文字 embedding -------
+            # ------- visual prefix + text embeddings -------
             inputs_embeds = torch.cat([vis_emb, txt_emb], dim=1)  # (B, 1 + L-1, H)
 
-            # ------- 前向與 loss（只對應 target_ids 設定位置）-------
+            # ------- forward and loss on target positions -------
             with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 logits = dec(inputs_embeds=inputs_embeds)           # (B, 1+L-1, V)
-                # 去掉前綴 1 個位置，對齊 target_ids（尺寸 (B, L-1)）
+                # drop the prefix position to align with target_ids, shape (B, L-1)
                 logits_text = logits[:, vis_prefix_len:, :]         # (B, L-1, V)
                 loss = loss_fn(logits_text.reshape(-1, logits_text.size(-1)),
                                target_ids.reshape(-1))
 
-            # ------- 反向與更新 -------
+            # ------- backward and update -------
             if use_bf16:
                 loss.backward()
             else:
@@ -300,19 +300,19 @@ def main():
             if it % 50 == 0:
                 print(f"Epoch {ep} | step {it} | loss {running/it:.4f}")
 
-        # ------- 每個 epoch 保存 -------
+        # ------- save every epoch -------
         os.makedirs(os.path.dirname(args.output_lora), exist_ok=True)
         os.makedirs(os.path.dirname(args.output_projector), exist_ok=True)
 
-        # 只存 LoRA 權重（給 decoder 用）
+        # save LoRA weights only
         torch.save(lora.lora_state_dict(dec, bias="none"), args.output_lora)
-        # 存 projector 全量權重（state_dict）
+        # save the full projector state_dict
         torch.save(projector.state_dict(), args.output_projector)
 
-        print(f"💾 Saved LoRA to: {args.output_lora}")
-        print(f"💾 Saved projector to: {args.output_projector}")
+        print(f"Saved LoRA to: {args.output_lora}")
+        print(f"Saved projector to: {args.output_projector}")
 
-    print("✅ Training finished. Projector + LoRA weights are ready for inference.")
+    print("Training finished. Projector + LoRA weights are ready for inference.")
 
 
 if __name__ == "__main__":

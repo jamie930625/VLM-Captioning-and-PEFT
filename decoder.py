@@ -1,10 +1,10 @@
 # ==========================================================
-# ✅ DLCV HW3 Part 2 — Final Correct Decoder (LoRA version + robust generate)
+# DLCV HW3 Part 2: Qwen3-style decoder with LoRA and sampling-based generation
 # ----------------------------------------------------------
-# ✔ 與 train_decoder.py / inference.py 直接對接
-# ✔ 支援以 inputs_embeds 起步（視覺前綴 + prompt）或 input_ids 起步
-# ✔ LoRA 僅訓練 Q/K/V/O，參數 < 10M（不改動現有結構）
-# ✔ 內建 temperature / top_p / repetition_penalty / eos 停止
+# - used by train_decoder.py and inference.py
+# - generation can start from inputs_embeds (visual prefix + prompt) or input_ids
+# - LoRA on Q/K/V/O only, < 10M trainable parameters
+# - temperature, top-p, repetition penalty, and EOS stopping
 # ==========================================================
 
 from typing import Optional
@@ -13,7 +13,7 @@ from torch import nn
 import loralib as lora
 
 # ==========================================================
-# 基本設定
+# basic settings
 # ==========================================================
 class Config:
     def __init__(self):
@@ -65,7 +65,7 @@ class Qwen3MLP(nn.Module):
 
 
 # ==========================================================
-# Rotary Embedding 工具
+# rotary embedding helpers
 # ==========================================================
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
@@ -116,7 +116,7 @@ class Qwen3Attention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
 
-        # ✅ LoRA on Q/K/V/O（保留，不改）
+        # LoRA on Q/K/V/O
         self.q_proj = lora.Linear(config.hidden_size, config.num_attention_heads * self.head_dim,
                                   r=16, lora_alpha=32, lora_dropout=0.05, merge_weights=False, bias=False)
         self.k_proj = lora.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim,
@@ -186,7 +186,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 # ==========================================================
-# Decoder 主體
+# decoder
 # ==========================================================
 class Decoder(nn.Module):
     def __init__(self, config: Config):
@@ -198,7 +198,7 @@ class Decoder(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.config = config
 
-    # -------- 主要前向：支援 inputs_embeds 或 input_ids --------
+    # -------- forward: accepts inputs_embeds or input_ids --------
     def forward(self, input_ids=None, inputs_embeds=None, position_ids=None, attention_mask=None):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -220,12 +220,12 @@ class Decoder(nn.Module):
         h = self.norm(h)
         return self.lm_head(h)
 
-    # -------- 取樣工具 --------
+    # -------- sampling helpers --------
     @staticmethod
     def _apply_repetition_penalty(logits, generated_ids, penalty: float):
         if generated_ids is None or penalty == 1.0:
             return logits
-        # 將已生成過的 token logits 降權（ >1 代表懲罰 ）
+        # down-weight logits of tokens already generated (penalty > 1)
         uniq = generated_ids.unique()
         logits.index_copy_(dim=-1, index=uniq, source=logits[..., uniq] / penalty)
         return logits
@@ -238,15 +238,15 @@ class Decoder(nn.Module):
         sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
         cum = torch.cumsum(sorted_probs, dim=-1)
         mask = cum > top_p
-        # 保留第一個超過 top_p 的位置
+        # keep the first token that crosses top_p
         mask[..., 0] = False
         sorted_probs = sorted_probs.masked_fill(mask, 0.0)
-        # 轉回 logits（加一個小常數避免 log(0)）
+        # back to logits (small epsilon avoids log(0))
         new_logits = torch.full_like(logits, float("-inf"))
         new_logits.scatter_(dim=-1, index=sorted_idx, src=torch.log(sorted_probs + 1e-12))
         return new_logits
 
-    # -------- 生成：支援從 inputs_embeds 或 input_ids 起步 --------
+    # -------- generate: start from inputs_embeds or input_ids --------
     @torch.no_grad()
     def generate(
         self,
@@ -260,46 +260,46 @@ class Decoder(nn.Module):
     ):
         device = next(self.parameters()).device
 
-        # 起點：embedding 或 id
+        # starting point: embeddings or ids
         if inputs_embeds is None:
             if input_ids is None:
-                raise ValueError("generate() 需要 input_ids 或 inputs_embeds 其中之一。")
+                raise ValueError("generate() requires either input_ids or inputs_embeds.")
             input_ids = input_ids.to(device)
             cur_embeds = self.embed_tokens(input_ids)
         else:
             cur_embeds = inputs_embeds.to(device)
             if input_ids is None:
-                # 若沒有提供對應的 input_ids，建立空的 ids，用於追蹤生成序列
+                # without input_ids, start from an empty sequence to track generated tokens
                 input_ids = torch.empty((cur_embeds.size(0), 0), dtype=torch.long, device=device)
 
         B = cur_embeds.size(0)
-        generated = input_ids  # 追蹤完整 token 序列（只包含文字 token）
+        generated = input_ids  # full sequence of generated text tokens
 
         for _ in range(max_new_tokens):
-            logits = self(inputs_embeds=cur_embeds)[:, -1, :]  # 只取最後一步
-            # 重複懲罰
+            logits = self(inputs_embeds=cur_embeds)[:, -1, :]  # last step only
+            # repetition penalty
             logits = self._apply_repetition_penalty(logits, generated, repetition_penalty)
 
-            # 溫度/Top-p
+            # temperature / top-p
             if temperature != 1.0:
                 logits = logits / max(temperature, 1e-6)
             logits = self._top_p_filter(logits, top_p)
 
-            # 取樣（或貪婪當作特例）
+            # sample (greedy as a special case)
             if top_p < 1.0 or temperature != 1.0:
                 probs = torch.softmax(logits, dim=-1)
                 next_id = torch.multinomial(probs, num_samples=1)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
 
-            # 續接 ids 與 embeds
+            # append to ids and embeddings
             generated = torch.cat([generated, next_id], dim=1)
             next_emb = self.embed_tokens(next_id)  # (B,1,H)
             cur_embeds = torch.cat([cur_embeds, next_emb], dim=1)
 
-            # 早停
+            # early stopping
             if eos_token_id is not None:
-                # 若 batch 中所有樣本都生成到 eos，則停止
+                # stop when every sample in the batch has produced EOS
                 if torch.all(next_id.squeeze(-1) == eos_token_id):
                     break
 

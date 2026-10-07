@@ -10,7 +10,7 @@ from vcd_utils.vcd_sample import evolve_vcd_sampling
 from vcd_utils.vcd_add_noise import add_diffusion_noise
 
 # ===============================================================
-# ✅ VCD Inference Script for DLCV HW3 (Problem 1-2)
+# VCD inference script for DLCV HW3 (Problem 1-2)
 # ===============================================================
 
 @torch.inference_mode()
@@ -28,8 +28,8 @@ def main():
 # ---------------------------------------------------------------
 # 1️⃣ Load pretrained model (LLaVA-v1.5-7b)
 # ---------------------------------------------------------------
-    print("🧠 Loading pretrained LLaVA model ...")
-    llava_weight = args.llava_weight  # 保持名稱一致
+    print("Loading pretrained LLaVA model ...")
+    llava_weight = args.llava_weight
     tokenizer, model, image_processor, _ = load_pretrained_model(
         llava_weight,
         model_base=None,
@@ -39,7 +39,7 @@ def main():
     )
     model.eval()
     evolve_vcd_sampling()  # enable Visual Contrastive Decoding
-    print("✅ Model ready for VCD inference")
+    print("Model ready for VCD inference")
 
     # ---------------------------------------------------------------
     # 2️⃣ Load dataset annotations
@@ -115,8 +115,8 @@ def main():
     with open(args.pred_file, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
-    print(f"🎯 Done! Results saved to {args.pred_file}")
-    print(f"✅ Total samples: {len(results)}")
+    print(f"Done! Results saved to {args.pred_file}")
+    print(f"Total samples: {len(results)}")
 
 
 if __name__ == "__main__":
